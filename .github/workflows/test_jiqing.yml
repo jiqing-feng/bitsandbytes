@@ -1,0 +1,17 @@
+name: Test Jiqing Upload PR Documentation
+
+on:
+  workflow_run:
+    workflows: ["Test Jiqing Build PR Documentation"]
+    types:
+      - completed
+
+jobs:
+  build:
+    runs-on: self-hosted
+    uses: huggingface/doc-builder/.github/workflows/upload_pr_documentation.yml@main
+    with:
+      package_name: bitsandbytes
+    secrets:
+      hf_token: ${{ secrets.HUGGINGFACE_PUSH }}
+      comment_bot_token: ${{ secrets.GITHUB_TOKEN }}
