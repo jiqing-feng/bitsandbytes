@@ -652,29 +652,27 @@ class Int8Params(torch.nn.Parameter):
         return new_instance
 
     def cpu(self):
-        # we store the 8-bit rows-major weight
-        B = self.data.contiguous().to(torch.bfloat16).cpu()
-        CB, CBt, SCB, SCBt, coo_tensorB = bnb.functional.double_quant(B)
-        if CBt is not None:
-            del CBt
-        if SCBt is not None:
-            del SCBt
-        self.data = CB
-        self.CB = CB
-        self.SCB = SCB
+        if self.has_fp16_weights:
+            return super().cpu(device)
+        else:
+            # we store the 8-bit rows-major weight
+            B = self.data.contiguous().to(torch.bfloat16).cpu()
+            CB, SCB, _ = bnb.functional.int8_vectorwise_quant(B)
+            self.data = CB
+            self.CB = CB
+            self.SCB = SCB
         return self
 
     def xpu(self, device):
-        # we store the 8-bit rows-major weight
-        B = self.data.contiguous().to(torch.float16).xpu(device)
-        CB, CBt, SCB, SCBt, coo_tensorB = bnb.functional.double_quant(B)
-        if CBt is not None:
-            del CBt
-        if SCBt is not None:
-            del SCBt
-        self.data = CB
-        self.CB = CB
-        self.SCB = SCB
+        if self.has_fp16_weights:
+            return super().xpu(device)
+        else:
+            # we store the 8-bit rows-major weight
+            B = self.data.contiguous().to(torch.float16).xpu(device)
+            CB, SCB, _ = bnb.functional.int8_vectorwise_quant(B)
+            self.data = CB
+            self.CB = CB
+            self.SCB = SCB
         return self
 
     @overload
