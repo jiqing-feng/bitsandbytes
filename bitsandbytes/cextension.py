@@ -101,21 +101,24 @@ try:
 except Exception:
     is_ipex_available = False
 
-try:
-    if torch.version.hip:
-        hip_major, hip_minor = map(int, torch.version.hip.split(".")[0:2])
-        HIP_ENVIRONMENT, BNB_HIP_VERSION = True, hip_major * 100 + hip_minor
-        BNB_HIP_VERSION_SHORT = f"{hip_major}{hip_minor}"
-        BNB_BACKEND = "ROCm"
-    else:
-        HIP_ENVIRONMENT, BNB_HIP_VERSION = False, 0
-        BNB_HIP_VERSION_SHORT = ""
-        BNB_BACKEND = "CUDA"
 
-    lib = get_native_library()
-except Exception as e:
+if is_ipex_available:
     lib = None
-    if not is_ipex_available:
+else:
+    try:
+        if torch.version.hip:
+            hip_major, hip_minor = map(int, torch.version.hip.split(".")[0:2])
+            HIP_ENVIRONMENT, BNB_HIP_VERSION = True, hip_major * 100 + hip_minor
+            BNB_HIP_VERSION_SHORT = f"{hip_major}{hip_minor}"
+            BNB_BACKEND = "ROCm"
+        else:
+            HIP_ENVIRONMENT, BNB_HIP_VERSION = False, 0
+            BNB_HIP_VERSION_SHORT = ""
+            BNB_BACKEND = "CUDA"
+
+        lib = get_native_library()
+    except Exception as e:
+        lib = None
         logger.error(
             f"Could not load bitsandbytes native library: {e}. If you use Intel CPU or XPU, please pip install intel_extension_for_pytorch",
             exc_info=True,
@@ -123,12 +126,12 @@ except Exception as e:
         if torch.cuda.is_available():
             logger.warning(
                 f"""
-    {BNB_BACKEND} Setup failed despite {BNB_BACKEND} being available. Please run the following command to get more information:
+        {BNB_BACKEND} Setup failed despite {BNB_BACKEND} being available. Please run the following command to get more information:
 
-    python -m bitsandbytes
+        python -m bitsandbytes
 
-    Inspect the output of the command and see if you can locate {BNB_BACKEND} libraries. You might need to add them
-    to your LD_LIBRARY_PATH. If you suspect a bug, please take the information from python -m bitsandbytes
-    and open an issue at: https://github.com/bitsandbytes-foundation/bitsandbytes/issues
-    """,
+        Inspect the output of the command and see if you can locate {BNB_BACKEND} libraries. You might need to add them
+        to your LD_LIBRARY_PATH. If you suspect a bug, please take the information from python -m bitsandbytes
+        and open an issue at: https://github.com/bitsandbytes-foundation/bitsandbytes/issues
+        """,
             )
