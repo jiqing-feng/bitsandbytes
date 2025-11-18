@@ -1,3 +1,5 @@
+#include <ATen/ATen.h>
+#include <ATen/native/CPUBlas.h>
 #include <BinSearch.h>
 #include <cpu_ops.h>
 #include <thread>
@@ -230,12 +232,97 @@ void quantize_cpu(float* code, float* A, float* absmax, unsigned char* out, long
 
 #define CVT_BF16_TO_FP32(a) _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(a), 16))
 
+inline void unpack_B(
+    bf16_t* __restrict__ Btmp, const unsigned char* __restrict__ packed_B,
+    const bf16_t* __restrict__ Bs, // scales [K/gs, N] in bf16
+    int64_t N, int64_t K, int group_size, int64_t ldb, int64_t ldb_tmp, int64_t strideBs
+) {
+    // Dequant: (w - z) * s -> bf16
+    const int64_t K2 = K >> 1; // 2 weights packed per byte
+    const int64_t gs2 = group_size >> 1;
+    const int64_t ldb2 = ldb;                         // packed leading dimension (bytes)
+    const int64_t ldb_tmp2 = ldb_tmp;                 // output leading dimension in elements
+    float* btmp_ptr = reinterpret_cast<float*>(Btmp); // direct bf16 storage
+
+    __m256i mask = _mm256_set1_epi8(0xF);   // low nibble
+    __m256i fifteen = _mm256_set1_epi8(15); // shift [-15,15] -> [0,30] for LUT
+    __m512i bf16_lut = _mm512_set_epi16(
+        0x0000, 0x4170, 0x4160, 0x4150, 0x4140, 0x4130, 0x4120, 0x4110, 0x4100, 0x40E0, 0x40C0, 0x40A0, 0x4080, 0x4040,
+        0x4000, 0x3F80, 0x0000, -0x4080, -0x4000, -0x3FC0, -0x3F80, -0x3F60, -0x3F40, -0x3F20, -0x3F00, -0x3EF0,
+        -0x3EE0, -0x3ED0, -0x3EC0, -0x3EB0, -0x3EA0, -0x3E90
+    );
+    __m512i s_idx1 = _mm512_set_epi32(15, 15, 14, 14, 13, 13, 12, 12, 11, 11, 10, 10, 9, 9, 8, 8);
+    __m512i s_idx0 = _mm512_set_epi32(7, 7, 6, 6, 5, 5, 4, 4, 3, 3, 2, 2, 1, 1, 0, 0);
+
+    __m512 scale_lo_fp32, scale_hi_fp32;
+    __m512 scales[4];
+
+    for (int64_t n = 0; n < N; n += 32) {
+        for (int64_t k = 0; k < K2; ++k) {
+            if (k % gs2 == 0) {
+                const int64_t kgs = k / gs2;
+                // Load 32 scales (bf16) -> two fp32 vectors (first16, second16)
+                __m512i scales_bf16 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(Bs + kgs * strideBs + n));
+                scale_lo_fp32 = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(scales_bf16, 0));
+                scale_hi_fp32 = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(scales_bf16, 1));
+                scales[0] = _mm512_permutexvar_ps(s_idx0, scale_lo_fp32);
+                scales[1] = _mm512_permutexvar_ps(s_idx1, scale_lo_fp32);
+                scales[2] = _mm512_permutexvar_ps(s_idx0, scale_hi_fp32);
+                scales[3] = _mm512_permutexvar_ps(s_idx1, scale_hi_fp32);
+            }
+
+            // Load packed 32 bytes => 64 int4
+            __m256i w_u4 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(packed_B + k * ldb2 + n));
+
+            // Split nibbles
+            __m256i w_lo = w_u4 & mask;
+            __m256i w_hi = _mm256_srli_epi16(w_u4, 4) & mask;
+
+            // Shift to [0..30] before LUT
+            w_lo = _mm256_add_epi8(w_lo, fifteen);
+            w_hi = _mm256_add_epi8(w_hi, fifteen);
+
+            // Lookup (w - z) -> bf16 using LUT (process 16-byte halves)
+            __m512i w_lo_bf16 = _mm512_permutexvar_epi16(_mm512_cvtepi8_epi16(w_lo), bf16_lut);
+            __m512i w_hi_bf16 = _mm512_permutexvar_epi16(_mm512_cvtepi8_epi16(w_hi), bf16_lut);
+
+            __m512 vb_00 = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(w_lo_bf16, 0));
+            __m512 vb_01 = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(w_lo_bf16, 1));
+            __m512 vb_10 = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(w_hi_bf16, 0));
+            __m512 vb_11 = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(w_hi_bf16, 1));
+
+            __m512 w_lo_fp32_0 = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(w_lo_bf16, 0)) * scales[0];
+            __m512 w_hi_fp32_0 = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(w_lo_bf16, 1)) * scales[1];
+            __m512 w_lo_fp32_1 = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(w_hi_bf16, 0)) * scales[2];
+            __m512 w_hi_fp32_1 = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(w_hi_bf16, 1)) * scales[3];
+
+            // Pack scaled (first 16 cols) then (second 16 cols) to bf16
+            __m512bh packed0 = _mm512_cvtne2ps_pbh(w_hi_fp32_0, w_lo_fp32_0);
+            __m512bh packed1 = _mm512_cvtne2ps_pbh(w_hi_fp32_1, w_lo_fp32_1);
+
+            // Store: two blocks of 16 bf16 (32 elements) per k iteration
+            _mm512_storeu_si512(btmp_ptr + (k * ldb_tmp2 + n + 0), (__m512i)packed0);
+            _mm512_storeu_si512(btmp_ptr + (k * ldb_tmp2 + n + 16), (__m512i)packed1);
+        }
+    }
+}
+
 template <typename scalar_t, int BLOCK_M, int BLOCK_N, int DATA_TYPE> struct tinygemm_kernel_nn {
     static inline void apply(
         const scalar_t*, const unsigned char*, scalar_t*, const scalar_t*, int64_t, int, int64_t, int64_t, int64_t,
         int64_t, int64_t
     ) {
         static_assert(sizeof(scalar_t) == 0, "tinygemm_kernel_nn primary template should never be instantiated");
+    }
+};
+
+template <typename scalar_t> struct brgemm {
+    static inline void apply(
+        const bf16_t* __restrict__ A, const unsigned char* __restrict__ B, bf16_t* __restrict__ C,
+        const bf16_t* __restrict__ Bs, bf16_t* __restrict__ Btmp, float* __restrict__ Ctmp, int64_t M, int64_t N,
+        int64_t K, int group_size, int64_t lda, int64_t ldb, int64_t ldc, int64_t strideBs, bool use_brgemm_dequant_out
+    ) {
+        static_assert(sizeof(scalar_t) == 0, "brgemm primary template should never be instantiated");
     }
 };
 
@@ -351,12 +438,49 @@ template <int BLOCK_M, int BLOCK_N, int DATA_TYPE> struct tinygemm_kernel_nn<bf1
         strideBz, strideBs                                                                                             \
     );
 
+struct brgemm<bf16_t> {
+    static inline void apply(
+        const bf16_t* __restrict__ A, const unsigned char* __restrict__ B, bf16_t* __restrict__ C,
+        const bf16_t* __restrict__ Bs, bf16_t* __restrict__ Btmp, float* __restrict__ Ctmp, int64_t M, int64_t N,
+        int64_t K, int group_size, int64_t lda, int64_t ldb, int64_t ldc, int64_t strideBs, bool use_brgemm_dequant_out
+    ) {
+        constexpr int BLOCK_N = block_size_n();
+        const int ldb_tmp = BLOCK_N;
+        alignas(64) float Ctmp_xsmm[BLOCK_N * M] = {0.f};
+        if (use_brgemm_dequant_out) {
+            at::native::cpublas::brgemm(M, N, K, lda, ldb_tmp, BLOCK_N, false, A, Btmp, Ctmp);
+        } else {
+            for (int64_t k = 0; k < K; k += BLOCK_K) {
+                int64_t kb_size = std::min(static_cast<int64_t>(BLOCK_K), K - k);
+                const int64_t kgs = k / group_size;
+
+                unpack_B(Btmp, B + (k >> 1) * ldb, Bs + kgs * strideBs, N, kb_size, group_size, ldb, ldb_tmp, strideBs);
+
+                const bool add_C = k != 0;
+                at::native::cpublas::brgemm(M, N, kb_size, lda, ldb_tmp, BLOCK_N, add_C, A + k, Btmp, Ctmp);
+            }
+        }
+
+        // copy from Ctmp to C
+        for (int64_t m = 0; m < M; ++m) {
+            copy_stub(C + m * ldc, Ctmp + m * BLOCK_N, N);
+        }
+    }
+};
+
 template <typename scalar_t, int DATA_TYPE>
 void tinygemm_kernel(
     const scalar_t* __restrict__ A, const unsigned char* __restrict__ B, scalar_t* __restrict__ C,
     const scalar_t* __restrict__ Bs, scalar_t* __restrict__ Btmp, float* __restrict__ Ctmp, int64_t M, int64_t N,
-    int64_t K, int group_size, int64_t lda, int64_t ldb, int64_t ldc, int64_t strideBz, int64_t strideBs
+    int64_t K, int group_size, int64_t lda, int64_t ldb, int64_t ldc, int64_t strideBz, int64_t strideBs, bool brg,
+    bool use_brgemm_dequant_out = false
 ) {
+    if (brg) {
+        brgemm<scalar_t>::apply(
+            A, B, C, Bs, Btmp, Ctmp, M, N, K, group_size, lda, ldb, ldc, strideBs, use_brgemm_dequant_out
+        );
+        return;
+    }
     constexpr int64_t BLOCK_M = 4;
     constexpr int64_t BLOCK_N = 64;
     const int64_t MB = div_up(M, BLOCK_M);
@@ -417,10 +541,40 @@ void gemv_4bit_inference(
     constexpr int64_t BLOCK_N = block_size_n(); // 32
     const int64_t MB = div_up(M, BLOCK_M);      // （x + y -1）/ y, res = 1 when M <= 32
     const int64_t NB = div_up(N, BLOCK_N);
-    // TODO: enable brgemm in the future.
-    // const bool use_brgemm = M > 4;
-    // const bool use_brgemm_dequant_out = M > 512;
-    // T* Btmp_start = nullptr;
+    // TODO: Find better threshold.
+    const bool use_brgemm = M > 4;
+    const bool use_brgemm_dequant_out = M > 512;
+    T* Btmp_start = nullptr;
+    if (use_brgemm_dequant_out) {
+        // Layout: contiguous [N*K] elements, 64-byte aligned for AVX512 loads
+        size_t elems = static_cast<size_t>(N) * static_cast<size_t>(K);
+        size_t bytes = elems * sizeof(T);
+        void* raw = nullptr;
+        // round up to 64-byte multiple
+        size_t aligned_bytes = (bytes + 63) & ~size_t(63);
+        if (posix_memalign(&raw, 64, aligned_bytes) != 0 || !raw) {
+            throw std::bad_alloc();
+        }
+        Btmp_start = static_cast<T*>(raw);
+        BNB_OMP_PARALLEL_FOR
+        for (int64_t nb = 0; nb < NB; ++nb) {
+            int64_t nb_start = nb * BLOCK_N;
+            int64_t nb_size = std::min(N - nb_start, (int64_t)BLOCK_N);
+            auto Btmp = Btmp_start + nb_start * K; // rows=N, each row K elements
+            for (int64_t k = 0; k < K; k += BLOCK_K) {
+                int64_t kb_size = std::min<int64_t>(BLOCK_K, K - k);
+                int64_t kgs = k / group_size;
+                auto strideBs = N;
+                int64_t ldb = nb_size;
+                auto Bs = w_scales + nb_start;
+                auto B = w + nb_start * K / 2;
+                unpack_B(
+                    Btmp + k * BLOCK_N, B + (k >> 1) * ldb, Bs + kgs * strideBs, kb_size, nb_size, group_size, ldb,
+                    BLOCK_N, strideBs
+                );
+            }
+        }
+    }
     // l2 cache block for n
     int64_t cache_blocks_nb = get_cache_blocks<T>(BLOCK_N * K);
     parallel_2d(MB, NB, [&](int64_t begin_mb, int64_t end_mb, int64_t begin_nb, int64_t end_nb) {
@@ -449,14 +603,16 @@ void gemv_4bit_inference(
                         /* ldb  */ nb_size,
                         /* ldc  */ out_stride,
                         /* sBz  */ N,
-                        /* sBs  */ N
+                        /* sBs  */ N,
+                        /* brg  */ use_brgemm,
+                        /* dequant choice*/ use_brgemm_dequant_out
                     );
                 }
             }
         }
-        // if (use_brgemm) {
-        //     at::native::cpublas::brgemm_release();
-        // }
+        if (use_brgemm) {
+            at::native::cpublas::brgemm_release();
+        }
     });
 }
 #endif
