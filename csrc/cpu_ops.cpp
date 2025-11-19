@@ -1,5 +1,7 @@
+#ifdef HAS_TORCH
 #include <ATen/ATen.h>
 #include <ATen/native/CPUBlas.h>
+#endif
 #include <BinSearch.h>
 #include <cpu_ops.h>
 #include <thread>
@@ -232,14 +234,27 @@ void quantize_cpu(float* code, float* A, float* absmax, unsigned char* out, long
 
 #define CVT_BF16_TO_FP32(a) _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(a), 16))
 
+#ifdef HAS_TORCH
+static inline const at::BFloat16* cast_at_bf16(const bf16_t* p) {
+    static_assert(sizeof(bf16_t) == sizeof(at::BFloat16), "bf16_t size mismatch");
+    return reinterpret_cast<const at::BFloat16*>(p);
+}
+
+static inline at::BFloat16* cast_at_bf16(bf16_t* p) {
+    static_assert(sizeof(bf16_t) == sizeof(at::BFloat16), "bf16_t size mismatch");
+    return reinterpret_cast<at::BFloat16*>(p);
+}
+#endif
+
+template <int DATA_TYPE>
 inline void unpack_B(
     bf16_t* __restrict__ Btmp, const unsigned char* __restrict__ packed_B,
     const bf16_t* __restrict__ Bs, // scales [K/gs, N] in bf16
-    int64_t N, int64_t K, int group_size, int64_t ldb, int64_t ldb_tmp, int64_t strideBs
+    int64_t N, int64_t K, int blocksize, int64_t ldb, int64_t ldb_tmp, int64_t strideBs
 ) {
     // Dequant: (w - z) * s -> bf16
     const int64_t K2 = K >> 1; // 2 weights packed per byte
-    const int64_t gs2 = group_size >> 1;
+    const int64_t gs2 = blocksize >> 1;
     const int64_t ldb2 = ldb;                         // packed leading dimension (bytes)
     const int64_t ldb_tmp2 = ldb_tmp;                 // output leading dimension in elements
     float* btmp_ptr = reinterpret_cast<float*>(Btmp); // direct bf16 storage
@@ -251,6 +266,17 @@ inline void unpack_B(
         0x4000, 0x3F80, 0x0000, -0x4080, -0x4000, -0x3FC0, -0x3F80, -0x3F60, -0x3F40, -0x3F20, -0x3F00, -0x3EF0,
         -0x3EE0, -0x3ED0, -0x3EC0, -0x3EB0, -0x3EA0, -0x3E90
     );
+    __m512i lut = DATA_TYPE == 1
+                      ? _mm512_set_epi16(
+                            0x0000, -0x4180, -0x41D5, -0x4100, -0x4155, -0x4080, -0x40D5, -0x4455, 0x0000, 0x3E80,
+                            0x3E2B, 0x3F00, 0x3EAB, 0x3F80, 0x3F2B, 0x3BAB, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+                            0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000
+                        )
+                      : _mm512_set_epi16(
+                            0x0000, 0x3F80, 0x3F39, 0x3F10, 0x3EE2, 0x3EAD, 0x3E7C, 0x3E25, 0x3DA3, 0x0000, -0x4246,
+                            -0x41C3, -0x416E, -0x4136, -0x40FA, -0x40CE, -0x4080, 0x0000, 0x0000, 0x0000, 0x0000,
+                            0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000
+                        );
     __m512i s_idx1 = _mm512_set_epi32(15, 15, 14, 14, 13, 13, 12, 12, 11, 11, 10, 10, 9, 9, 8, 8);
     __m512i s_idx0 = _mm512_set_epi32(7, 7, 6, 6, 5, 5, 4, 4, 3, 3, 2, 2, 1, 1, 0, 0);
 
@@ -283,8 +309,8 @@ inline void unpack_B(
             w_hi = _mm256_add_epi8(w_hi, fifteen);
 
             // Lookup (w - z) -> bf16 using LUT (process 16-byte halves)
-            __m512i w_lo_bf16 = _mm512_permutexvar_epi16(_mm512_cvtepi8_epi16(w_lo), bf16_lut);
-            __m512i w_hi_bf16 = _mm512_permutexvar_epi16(_mm512_cvtepi8_epi16(w_hi), bf16_lut);
+            __m512i w_lo_bf16 = _mm512_permutexvar_epi16(_mm512_cvtepi8_epi16(w_lo), lut);
+            __m512i w_hi_bf16 = _mm512_permutexvar_epi16(_mm512_cvtepi8_epi16(w_hi), lut);
 
             __m512 vb_00 = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(w_lo_bf16, 0));
             __m512 vb_01 = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(w_lo_bf16, 1));
@@ -316,11 +342,11 @@ template <typename scalar_t, int BLOCK_M, int BLOCK_N, int DATA_TYPE> struct tin
     }
 };
 
-template <typename scalar_t> struct brgemm {
+template <typename scalar_t, int DATA_TYPE> struct brgemm {
     static inline void apply(
-        const bf16_t* __restrict__ A, const unsigned char* __restrict__ B, bf16_t* __restrict__ C,
-        const bf16_t* __restrict__ Bs, bf16_t* __restrict__ Btmp, float* __restrict__ Ctmp, int64_t M, int64_t N,
-        int64_t K, int group_size, int64_t lda, int64_t ldb, int64_t ldc, int64_t strideBs, bool use_brgemm_dequant_out
+        const scalar_t* __restrict__ A, const unsigned char* __restrict__ B, scalar_t* __restrict__ C,
+        const scalar_t* __restrict__ Bs, scalar_t* __restrict__ Btmp, float* __restrict__ Ctmp, int64_t M, int64_t N,
+        int64_t K, int blocksize, int64_t lda, int64_t ldb, int64_t ldc, int64_t strideBs, bool use_brgemm_dequant_out
     ) {
         static_assert(sizeof(scalar_t) == 0, "brgemm primary template should never be instantiated");
     }
@@ -329,7 +355,7 @@ template <typename scalar_t> struct brgemm {
 template <int BLOCK_M, int BLOCK_N, int DATA_TYPE> struct tinygemm_kernel_nn<bf16_t, BLOCK_M, BLOCK_N, DATA_TYPE> {
     static inline void apply(
         const bf16_t* __restrict__ A, const unsigned char* __restrict__ B, bf16_t* __restrict__ C,
-        const bf16_t* __restrict__ Bs, int64_t K, int group_size, int64_t lda, int64_t ldb, int64_t ldc,
+        const bf16_t* __restrict__ Bs, int64_t K, int blocksize, int64_t lda, int64_t ldb, int64_t ldc,
         int64_t strideBz, int64_t strideBs
     ) {
         static_assert(BLOCK_N % 32 == 0);
@@ -360,8 +386,8 @@ template <int BLOCK_M, int BLOCK_N, int DATA_TYPE> struct tinygemm_kernel_nn<bf1
         __m512 scales[COLS];
         const int64_t K2 = K >> 1;
         const int64_t lda2 = lda >> 1;
-        const int64_t ldb2 = ldb;            // ldb * 2 >> 1;
-        const int64_t gs2 = group_size >> 1; // 64 / 2 = 32
+        const int64_t ldb2 = ldb;           // ldb * 2 >> 1;
+        const int64_t gs2 = blocksize >> 1; // 64 / 2 = 32
         const float* a_ptr = reinterpret_cast<const float*>(A);
 
         auto loadc = [&](auto i) {
@@ -434,50 +460,105 @@ template <int BLOCK_M, int BLOCK_N, int DATA_TYPE> struct tinygemm_kernel_nn<bf1
 
 #define LAUNCH_TINYGEMM_KERNEL_NN(MB_SIZE, NB_SIZE, DATA_TYPE)                                                         \
     tinygemm_kernel_nn<scalar_t, MB_SIZE, NB_SIZE, DATA_TYPE>::apply(                                                  \
-        A + mb_start * lda, B + nb_start, C + mb_start * ldc + nb_start, Bs + nb_start, K, group_size, lda, ldb, ldc,  \
+        A + mb_start * lda, B + nb_start, C + mb_start * ldc + nb_start, Bs + nb_start, K, blocksize, lda, ldb, ldc,   \
         strideBz, strideBs                                                                                             \
     );
 
-struct brgemm<bf16_t> {
+#ifdef HAS_TORCH
+
+inline uint16_t float_to_bf16_round(float x) {
+    uint32_t u;
+    std::memcpy(&u, &x, sizeof(u));
+    uint32_t lsb = (u >> 16) & 1;
+    uint32_t rounding_bias = 0x7fff + lsb;
+    u += rounding_bias;
+    uint16_t hi = static_cast<uint16_t>(u >> 16);
+    // Quiet NaN handling
+    if ((u & 0x7f800000) == 0x7f800000 && (u & 0x007fffff)) {
+        hi = 0xffff;
+    }
+    return hi;
+}
+
+template <typename scalar_t>
+inline void copy_stub(scalar_t* __restrict__ out, const float* __restrict__ input, int64_t size) {
+#if defined(__AVX512BF16__)
+    if (has_avx512bf16()) {
+        int64_t d = 0;
+        const int V = 32;
+        for (; d + V <= size; d += V) {
+            __m512 lo = _mm512_loadu_ps(input + d);
+            __m512 hi = _mm512_loadu_ps(input + d + 16);
+            __m512bh packed = _mm512_cvtne2ps_pbh(hi, lo);
+            _mm512_storeu_si512(reinterpret_cast<void*>(out + d), (__m512i)packed);
+        }
+        for (; d < size; ++d) {
+            if constexpr (std::is_same_v<scalar_t, bf16_t>) {
+                // store raw bf16 bits
+                reinterpret_cast<uint16_t*>(out)[d] = float_to_bf16_round(input[d]);
+            } else {
+                out[d] = static_cast<scalar_t>(input[d]);
+            }
+        }
+        return;
+    }
+#endif
+    for (int64_t d = 0; d < size; ++d) {
+        if constexpr (std::is_same_v<scalar_t, bf16_t>) {
+            reinterpret_cast<uint16_t*>(out)[d] = float_to_bf16_round(input[d]);
+        } else {
+            out[d] = static_cast<scalar_t>(input[d]);
+        }
+    }
+}
+
+template <int DATA_TYPE> struct brgemm<bf16_t, DATA_TYPE> {
     static inline void apply(
         const bf16_t* __restrict__ A, const unsigned char* __restrict__ B, bf16_t* __restrict__ C,
         const bf16_t* __restrict__ Bs, bf16_t* __restrict__ Btmp, float* __restrict__ Ctmp, int64_t M, int64_t N,
-        int64_t K, int group_size, int64_t lda, int64_t ldb, int64_t ldc, int64_t strideBs, bool use_brgemm_dequant_out
+        int64_t K, int blocksize, int64_t lda, int64_t ldb, int64_t ldc, int64_t strideBs, bool use_brgemm_dequant_out
     ) {
         constexpr int BLOCK_N = block_size_n();
         const int ldb_tmp = BLOCK_N;
         alignas(64) float Ctmp_xsmm[BLOCK_N * M] = {0.f};
         if (use_brgemm_dequant_out) {
-            at::native::cpublas::brgemm(M, N, K, lda, ldb_tmp, BLOCK_N, false, A, Btmp, Ctmp);
+            at::native::cpublas::brgemm(
+                M, N, K, lda, ldb_tmp, BLOCK_N, false, cast_at_bf16(A), cast_at_bf16(Btmp), Ctmp
+            );
         } else {
             for (int64_t k = 0; k < K; k += BLOCK_K) {
                 int64_t kb_size = std::min(static_cast<int64_t>(BLOCK_K), K - k);
-                const int64_t kgs = k / group_size;
+                const int64_t kgs = k / blocksize;
 
-                unpack_B(Btmp, B + (k >> 1) * ldb, Bs + kgs * strideBs, N, kb_size, group_size, ldb, ldb_tmp, strideBs);
+                unpack_B<DATA_TYPE>(
+                    Btmp, B + (k >> 1) * ldb, Bs + kgs * strideBs, N, kb_size, blocksize, ldb, ldb_tmp, strideBs
+                );
 
                 const bool add_C = k != 0;
-                at::native::cpublas::brgemm(M, N, kb_size, lda, ldb_tmp, BLOCK_N, add_C, A + k, Btmp, Ctmp);
+                at::native::cpublas::brgemm(
+                    M, N, kb_size, lda, ldb_tmp, BLOCK_N, add_C, cast_at_bf16(A + k), cast_at_bf16(Btmp), Ctmp
+                );
             }
         }
 
         // copy from Ctmp to C
         for (int64_t m = 0; m < M; ++m) {
-            copy_stub(C + m * ldc, Ctmp + m * BLOCK_N, N);
+            copy_stub<bf16_t>(C + m * ldc, Ctmp + m * BLOCK_N, N);
         }
     }
 };
+#endif
 
 template <typename scalar_t, int DATA_TYPE>
 void tinygemm_kernel(
     const scalar_t* __restrict__ A, const unsigned char* __restrict__ B, scalar_t* __restrict__ C,
     const scalar_t* __restrict__ Bs, scalar_t* __restrict__ Btmp, float* __restrict__ Ctmp, int64_t M, int64_t N,
-    int64_t K, int group_size, int64_t lda, int64_t ldb, int64_t ldc, int64_t strideBz, int64_t strideBs, bool brg,
+    int64_t K, int blocksize, int64_t lda, int64_t ldb, int64_t ldc, int64_t strideBz, int64_t strideBs, bool brg,
     bool use_brgemm_dequant_out = false
 ) {
     if (brg) {
-        brgemm<scalar_t>::apply(
-            A, B, C, Bs, Btmp, Ctmp, M, N, K, group_size, lda, ldb, ldc, strideBs, use_brgemm_dequant_out
+        brgemm<scalar_t, DATA_TYPE>::apply(
+            A, B, C, Bs, Btmp, Ctmp, M, N, K, blocksize, lda, ldb, ldc, strideBs, use_brgemm_dequant_out
         );
         return;
     }
@@ -542,8 +623,13 @@ void gemv_4bit_inference(
     const int64_t MB = div_up(M, BLOCK_M);      // （x + y -1）/ y, res = 1 when M <= 32
     const int64_t NB = div_up(N, BLOCK_N);
     // TODO: Find better threshold.
+#ifdef HAS_TORCH
     const bool use_brgemm = M > 4;
     const bool use_brgemm_dequant_out = M > 512;
+#else
+    const bool use_brgemm = false;
+    const bool use_brgemm_dequant_out = false;
+#endif
     T* Btmp_start = nullptr;
     if (use_brgemm_dequant_out) {
         // Layout: contiguous [N*K] elements, 64-byte aligned for AVX512 loads
@@ -563,13 +649,13 @@ void gemv_4bit_inference(
             auto Btmp = Btmp_start + nb_start * K; // rows=N, each row K elements
             for (int64_t k = 0; k < K; k += BLOCK_K) {
                 int64_t kb_size = std::min<int64_t>(BLOCK_K, K - k);
-                int64_t kgs = k / group_size;
+                int64_t kgs = k / blocksize;
                 auto strideBs = N;
                 int64_t ldb = nb_size;
-                auto Bs = w_scales + nb_start;
+                auto Bs = absmax + nb_start;
                 auto B = w + nb_start * K / 2;
-                unpack_B(
-                    Btmp + k * BLOCK_N, B + (k >> 1) * ldb, Bs + kgs * strideBs, kb_size, nb_size, group_size, ldb,
+                unpack_B<DATA_TYPE>(
+                    Btmp + k * BLOCK_N, B + (k >> 1) * ldb, Bs + kgs * strideBs, kb_size, nb_size, blocksize, ldb,
                     BLOCK_N, strideBs
                 );
             }
@@ -598,7 +684,7 @@ void gemv_4bit_inference(
                         /*   M  */ mb_size,
                         /*   N  */ nb_size,
                         /*   K  */ K,
-                        /*  gs  */ blocksize, // group_size
+                        /*  gs  */ blocksize, // blocksize
                         /* lda  */ x_stride,
                         /* ldb  */ nb_size,
                         /* ldc  */ out_stride,
@@ -610,9 +696,11 @@ void gemv_4bit_inference(
                 }
             }
         }
+#ifdef HAS_TORCH
         if (use_brgemm) {
             at::native::cpublas::brgemm_release();
         }
+#endif
     });
 }
 #endif
