@@ -248,7 +248,7 @@ static inline at::BFloat16* cast_at_bf16(bf16_t* p) {
 
 template <int DATA_TYPE>
 inline void unpack_B(
-    at::BFloat16* __restrict__ Btmp, const unsigned char* __restrict__ packed_B,
+    bf16_t* __restrict__ Btmp, const unsigned char* __restrict__ packed_B,
     const bf16_t* __restrict__ Bs, // scales [K/gs, N] in bf16
     int64_t N, int64_t K, int blocksize, int64_t ldb, int64_t ldb_tmp, int64_t strideBs
 ) {
@@ -261,11 +261,6 @@ inline void unpack_B(
 
     __m256i mask = _mm256_set1_epi8(0xF);   // low nibble
     __m256i fifteen = _mm256_set1_epi8(15); // shift [-15,15] -> [0,30] for LUT
-    __m512i bf16_lut = _mm512_set_epi16(
-        0x0000, 0x4170, 0x4160, 0x4150, 0x4140, 0x4130, 0x4120, 0x4110,
-        0x4100, 0x40E0, 0x40C0, 0x40A0, 0x4080, 0x4040, 0x4000, 0x3F80,
-        0x0000, -0x4080, -0x4000, -0x3FC0, -0x3F80, -0x3F60, -0x3F40, -0x3F20,
-        -0x3F00, -0x3EF0, -0x3EE0, -0x3ED0, -0x3EC0, -0x3EB0, -0x3EA0, -0x3E90);
     __m512i lut = DATA_TYPE == 1
                       ? _mm512_set_epi16(
                             0x0000, -0x4180, -0x41D5, -0x4100, -0x4155, -0x4080, -0x40D5, -0x4455, 0x0000, 0x3E80,
@@ -309,8 +304,8 @@ inline void unpack_B(
             w_hi = _mm256_add_epi8(w_hi, fifteen);
 
             // Lookup (w - z) -> bf16 using LUT (process 16-byte halves)
-            __m512i w_lo_bf16 = _mm512_permutexvar_epi16(_mm512_cvtepi8_epi16(w_lo), bf16_lut);
-            __m512i w_hi_bf16 = _mm512_permutexvar_epi16(_mm512_cvtepi8_epi16(w_hi), bf16_lut);
+            __m512i w_lo_bf16 = _mm512_permutexvar_epi16(_mm512_cvtepi8_epi16(w_lo), lut);
+            __m512i w_hi_bf16 = _mm512_permutexvar_epi16(_mm512_cvtepi8_epi16(w_hi), lut);
 
             __m512 w_lo_fp32_0 = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(w_lo_bf16, 0)) * scales[0];
             __m512 w_hi_fp32_0 = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(w_lo_bf16, 1)) * scales[1];
@@ -350,8 +345,7 @@ template <typename scalar_t, int DATA_TYPE> struct brgemm {
 template <int BLOCK_M, int BLOCK_N, int DATA_TYPE> struct tinygemm_kernel_nn<bf16_t, BLOCK_M, BLOCK_N, DATA_TYPE> {
     static inline void apply(
         const bf16_t* __restrict__ A, const unsigned char* __restrict__ B, bf16_t* __restrict__ C,
-        const bf16_t* __restrict__ Bs, int64_t K, int blocksize, int64_t lda, int64_t ldb, int64_t ldc,
-        int64_t strideBs
+        const bf16_t* __restrict__ Bs, int64_t K, int blocksize, int64_t lda, int64_t ldb, int64_t ldc, int64_t strideBs
     ) {
         static_assert(BLOCK_N % 32 == 0);
         constexpr int ROWS = BLOCK_M;      // 32
@@ -456,7 +450,7 @@ template <int BLOCK_M, int BLOCK_N, int DATA_TYPE> struct tinygemm_kernel_nn<bf1
 #define LAUNCH_TINYGEMM_KERNEL_NN(MB_SIZE, NB_SIZE, DATA_TYPE)                                                         \
     tinygemm_kernel_nn<scalar_t, MB_SIZE, NB_SIZE, DATA_TYPE>::apply(                                                  \
         A + mb_start * lda, B + nb_start, C + mb_start * ldc + nb_start, Bs + nb_start, K, blocksize, lda, ldb, ldc,   \
-        strideBs                                                                                             \
+        strideBs                                                                                                       \
     );
 
 #ifdef HAS_TORCH
@@ -510,14 +504,14 @@ inline void copy_stub(scalar_t* __restrict__ out, const float* __restrict__ inpu
 template <int DATA_TYPE> struct brgemm<bf16_t, DATA_TYPE> {
     static inline void apply(
         const bf16_t* __restrict__ A, const unsigned char* __restrict__ B, bf16_t* __restrict__ C,
-        const bf16_t* __restrict__ Bs, at::BFloat16* __restrict__ Btmp, float* __restrict__ Ctmp, int64_t M, int64_t N,
+        const bf16_t* __restrict__ Bs, bf16_t* __restrict__ Btmp, float* __restrict__ Ctmp, int64_t M, int64_t N,
         int64_t K, int blocksize, int64_t lda, int64_t ldb, int64_t ldc, int64_t strideBs, bool use_brgemm_dequant_out
     ) {
         constexpr int BLOCK_N = block_size_n();
         const int ldb_tmp = BLOCK_N;
         if (use_brgemm_dequant_out) {
             at::native::cpublas::brgemm(
-                M, N, K, lda, ldb_tmp, BLOCK_N, false, cast_at_bf16(A), Btmp, Ctmp
+                M, N, K, lda, ldb_tmp, BLOCK_N, false, cast_at_bf16(A), cast_at_bf16(Btmp), Ctmp
             );
         } else {
             for (int64_t k = 0; k < K; k += BLOCK_K) {
@@ -530,7 +524,7 @@ template <int DATA_TYPE> struct brgemm<bf16_t, DATA_TYPE> {
 
                 const bool add_C = k != 0;
                 at::native::cpublas::brgemm(
-                    M, N, kb_size, lda, ldb_tmp, BLOCK_N, add_C, cast_at_bf16(A + k), Btmp, Ctmp
+                    M, N, kb_size, lda, ldb_tmp, BLOCK_N, add_C, cast_at_bf16(A + k), cast_at_bf16(Btmp), Ctmp
                 );
             }
         }
@@ -546,7 +540,7 @@ template <int DATA_TYPE> struct brgemm<bf16_t, DATA_TYPE> {
 template <typename scalar_t, int DATA_TYPE>
 void tinygemm_kernel(
     const scalar_t* __restrict__ A, const unsigned char* __restrict__ B, scalar_t* __restrict__ C,
-    const scalar_t* __restrict__ Bs, at::BFloat16* __restrict__ Btmp, float* __restrict__ Ctmp, int64_t M, int64_t N,
+    const scalar_t* __restrict__ Bs, scalar_t* __restrict__ Btmp, float* __restrict__ Ctmp, int64_t M, int64_t N,
     int64_t K, int blocksize, int64_t lda, int64_t ldb, int64_t ldc, int64_t strideBs, bool brg,
     bool use_brgemm_dequant_out = false
 ) {
@@ -624,17 +618,22 @@ void gemv_4bit_inference(
     const bool use_brgemm = false;
     const bool use_brgemm_dequant_out = false;
 #endif
-    at::BFloat16* Btmp_start = nullptr;
+    T* Btmp_start = nullptr;
     if (use_brgemm_dequant_out) {
         // Layout: contiguous [N*K] elements, 64-byte aligned for AVX512 loads
-        at::Tensor Btmp_t = at::zeros({N, K}, at::dtype(at::kBFloat16));
-        Btmp_start = Btmp_t.data_ptr<at::BFloat16>();
+        // at::Tensor Btmp_t = at::zeros({N, K}, at::dtype(at::kBFloat16));
+        // at::BFloat16* Btmp_start_pt = Btmp_t.data_ptr<at::BFloat16>();
         // Btmp_start = reinterpret_cast<T*>(Btmp_start_pt);
+        size_t elems = static_cast<size_t>(N) * static_cast<size_t>(K);
+        size_t bytes = elems * sizeof(T);
+        T* Btmp_start_malloc = (T*)malloc(bytes);
+        std::memset(Btmp_start_malloc, 0, bytes);
+        Btmp_start = Btmp_start_malloc;
         BNB_OMP_PARALLEL_FOR
         for (int64_t nb = 0; nb < NB; ++nb) {
             int64_t nb_start = nb * BLOCK_N;
-            int64_t nb_size  = std::min<int64_t>(N - nb_start, BLOCK_N);
-            at::BFloat16* Btmp = Btmp_start + nb_start * K;
+            int64_t nb_size = std::min<int64_t>(N - nb_start, BLOCK_N);
+            T* Btmp = Btmp_start + nb_start * K;
             for (int64_t k = 0; k < K; k += BLOCK_K) {
                 int64_t kb_size = std::min<int64_t>(BLOCK_K, K - k);
                 int64_t kgs = k / blocksize;
@@ -643,15 +642,8 @@ void gemv_4bit_inference(
                 const T* Bs = absmax + nb_start;
                 const unsigned char* Bw = reinterpret_cast<const unsigned char*>(w + nb_start * K / 2);
                 unpack_B<DATA_TYPE>(
-                    Btmp + k * BLOCK_N,
-                    Bw + (k >> 1) * ldb,
-                    Bs + kgs * strideBs,
-                    nb_size,
-                    kb_size,
-                    blocksize,
-                    ldb,
-                    BLOCK_N,
-                    strideBs
+                    Btmp + k * BLOCK_N, Bw + (k >> 1) * ldb, Bs + kgs * strideBs, nb_size, kb_size, blocksize, ldb,
+                    BLOCK_N, strideBs
                 );
             }
         }
@@ -674,7 +666,7 @@ void gemv_4bit_inference(
                         /*   B  */ w + nb_start * K / 2, // divide by 2 since w is u4 packed in u8, K is w.size(1) * 2
                         /*   C  */ out + mb_start * out_stride + nb_start,
                         /*  Bs  */ absmax + nb_start,
-                        /* Btmp */ use_brgemm_dequant_out ? Btmp_start + nb_start * K : cast_at_bf16(Btmp_inner),
+                        /* Btmp */ use_brgemm_dequant_out ? Btmp_start + nb_start * K : Btmp_inner,
                         /* Ctmp */ Ctmp,
                         /*   M  */ mb_size,
                         /*   N  */ nb_size,
