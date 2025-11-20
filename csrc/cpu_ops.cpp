@@ -613,7 +613,7 @@ void gemv_4bit_inference(
     // TODO: Find better threshold.
 #ifdef HAS_TORCH
     const bool use_brgemm = M > 4;
-    const bool use_brgemm_dequant_out = M > 512;
+    const bool use_brgemm_dequant_out = M > 100;
     T* Btmp_start = nullptr;
     if (use_brgemm_dequant_out) {
         // Layout: contiguous [N*K] elements, 64-byte aligned for AVX512 loads
