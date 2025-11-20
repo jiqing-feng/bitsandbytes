@@ -614,21 +614,12 @@ void gemv_4bit_inference(
 #ifdef HAS_TORCH
     const bool use_brgemm = M > 4;
     const bool use_brgemm_dequant_out = M > 512;
-#else
-    const bool use_brgemm = false;
-    const bool use_brgemm_dequant_out = false;
-#endif
     T* Btmp_start = nullptr;
     if (use_brgemm_dequant_out) {
         // Layout: contiguous [N*K] elements, 64-byte aligned for AVX512 loads
-        // at::Tensor Btmp_t = at::zeros({N, K}, at::dtype(at::kBFloat16));
-        // at::BFloat16* Btmp_start_pt = Btmp_t.data_ptr<at::BFloat16>();
-        // Btmp_start = reinterpret_cast<T*>(Btmp_start_pt);
-        size_t elems = static_cast<size_t>(N) * static_cast<size_t>(K);
-        size_t bytes = elems * sizeof(T);
-        T* Btmp_start_malloc = (T*)malloc(bytes);
-        std::memset(Btmp_start_malloc, 0, bytes);
-        Btmp_start = Btmp_start_malloc;
+        at::Tensor Btmp_t = at::zeros({N, K}, at::dtype(at::kBFloat16));
+        at::BFloat16* Btmp_start_pt = Btmp_t.data_ptr<at::BFloat16>();
+        Btmp_start = reinterpret_cast<T*>(Btmp_start_pt);
         BNB_OMP_PARALLEL_FOR
         for (int64_t nb = 0; nb < NB; ++nb) {
             int64_t nb_start = nb * BLOCK_N;
@@ -648,6 +639,10 @@ void gemv_4bit_inference(
             }
         }
     }
+#else
+    const bool use_brgemm = false;
+    const bool use_brgemm_dequant_out = false;
+#endif
     // l2 cache block for n
     int64_t cache_blocks_nb = get_cache_blocks<T>(BLOCK_N * K);
     parallel_2d(MB, NB, [&](int64_t begin_mb, int64_t end_mb, int64_t begin_nb, int64_t end_nb) {
