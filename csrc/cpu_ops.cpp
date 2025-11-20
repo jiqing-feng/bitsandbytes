@@ -332,13 +332,14 @@ template <typename scalar_t, int BLOCK_M, int BLOCK_N, int DATA_TYPE> struct tin
     }
 };
 
+// The brgemm will not be used without HAS_TORCH
 template <typename scalar_t, int DATA_TYPE> struct brgemm {
     static inline void apply(
         const scalar_t* __restrict__ A, const unsigned char* __restrict__ B, scalar_t* __restrict__ C,
         const scalar_t* __restrict__ Bs, scalar_t* __restrict__ Btmp, float* __restrict__ Ctmp, int64_t M, int64_t N,
         int64_t K, int blocksize, int64_t lda, int64_t ldb, int64_t ldc, int64_t strideBs, bool use_brgemm_dequant_out
     ) {
-        static_assert(sizeof(scalar_t) == 0, "brgemm primary template should never be instantiated");
+        return;
     }
 };
 
