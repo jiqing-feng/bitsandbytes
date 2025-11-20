@@ -271,6 +271,7 @@ add_library(bitsandbytes SHARED ${SRC_FILES})
 target_compile_features(bitsandbytes PUBLIC cxx_std_17)
 target_include_directories(bitsandbytes PUBLIC csrc include)
 
+# set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g")
 if (BUILD_CPU)
     if (Torch_FOUND)
         target_link_libraries(bitsandbytes PRIVATE "${TORCH_LIBRARIES}")
