@@ -611,10 +611,10 @@ void gemv_4bit_inference(
     const int64_t MB = div_up(M, BLOCK_M);      // （x + y -1）/ y, res = 1 when M <= 32
     const int64_t NB = div_up(N, BLOCK_N);
     // TODO: Find better threshold.
+    T* Btmp_start = nullptr;
 #ifdef HAS_TORCH
     const bool use_brgemm = M > 4;
     const bool use_brgemm_dequant_out = M > 100;
-    T* Btmp_start = nullptr;
     if (use_brgemm_dequant_out) {
         // Layout: contiguous [N*K] elements, 64-byte aligned for AVX512 loads
         at::Tensor Btmp_t = at::zeros({N, K}, at::dtype(at::kBFloat16));
